@@ -29,6 +29,29 @@
 /* Current working directory — starts at fs_root */
 static fs_node_t* cwd;
 
+/*
+ * Kernel-internal clipboard.
+ *
+ * Shared between the shell readline (Ctrl+K/U cuts, Ctrl+V pastes)
+ * and the VIM editor (yy writes here so you can paste in the shell).
+ *
+ * This is NOT the host OS clipboard — QEMU has no mechanism to bridge
+ * the host clipboard to PS/2 keyboard input without SPICE or VirtIO.
+ */
+#define CLIPBOARD_SIZE 1024
+static char g_clipboard[CLIPBOARD_SIZE];
+
+void shell_set_clipboard(const char* text, int len) {
+    if (len < 0) len = 0;
+    if (len >= CLIPBOARD_SIZE) len = CLIPBOARD_SIZE - 1;
+    memcpy(g_clipboard, text, len);
+    g_clipboard[len] = '\0';
+}
+
+const char* shell_get_clipboard(void) {
+    return g_clipboard;
+}
+
 /* Forward declarations */
 static void print_prompt(void);
 static void cmd_help(int argc, char** argv);
@@ -54,6 +77,7 @@ static void cmd_load(int argc, char** argv);
 static void cmd_run(int argc, char** argv);
 static void cmd_vim(int argc, char** argv);
 static void cmd_keymap(int argc, char** argv);
+static void cmd_sleep(int argc, char** argv);
 
 typedef struct {
     const char* name;
@@ -85,6 +109,7 @@ static const command_t commands[] = {
     { "run",    "Run a HeroScript file: run <file.hero>", cmd_run   },
     { "keymap", "Set keyboard layout: keymap [us|it]",   cmd_keymap },
     { "halt",   "Shutdown the system",                   cmd_halt   },
+    { "sleep", "Pause for milliseconds: sleep [ms]  (default 1000)", cmd_sleep },
     { NULL, NULL, NULL }  /* Sentinel to mark end of table */
 };
 
@@ -330,6 +355,113 @@ static void shell_readline(char* buf, int max_len) {
             cursor = 0; len = 0; buf[0] = '\0';
             hist_idx = -1;
             REDRAW();
+            continue;
+        }
+
+        /* --- CTRL KEY BINDINGS ---
+         *
+         * Standard readline-style bindings.  Ctrl+letter arrives as
+         * the ASCII control code 0x01-0x1A (produced by keyboard.c).
+         *
+         * Internal clipboard note: these cut/paste keys use the
+         * kernel-internal clipboard (g_clipboard), NOT the host OS
+         * clipboard.  QEMU has no way to bridge the host clipboard to
+         * PS/2 keyboard input without SPICE or VirtIO infrastructure.
+         *
+         * Cross-app clipboard within the kernel:
+         *   • VIM  yy  → writes to the same clipboard
+         *   • Shell Ctrl+K / Ctrl+U → cut to clipboard
+         *   • Shell Ctrl+V / Ctrl+Y → paste from clipboard
+         */
+
+        /* Ctrl+C (0x03): cancel current line, like pressing Ctrl+C in bash */
+        if (key == 0x03) {
+            vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+            /* print ^C at the current cursor position then newline */
+            vga_move_cursor((uint8_t)(prompt_col + cursor), prompt_row);
+            vga_print("^C\n");
+            len = 0; cursor = 0; buf[0] = '\0';
+            hist_idx = -1;
+            break;  /* return empty buf → shell_exec_line ignores it */
+        }
+
+        /* Ctrl+L (0x0C): clear screen, reprint prompt, keep current input */
+        if (key == 0x0C) {
+            vga_clear();
+            print_prompt();
+            prompt_col = vga_get_col();
+            prompt_row = vga_get_row();
+            disp_len   = 0;
+            REDRAW();
+            continue;
+        }
+
+        /* Ctrl+A (0x01): jump to start of line */
+        if (key == 0x01) {
+            cursor = 0;
+            vga_move_cursor(prompt_col, prompt_row);
+            continue;
+        }
+
+        /* Ctrl+E (0x05): jump to end of line */
+        if (key == 0x05) {
+            cursor = len;
+            vga_move_cursor((uint8_t)(prompt_col + cursor), prompt_row);
+            continue;
+        }
+
+        /* Ctrl+K (0x0B): kill (cut) from cursor to end of line → clipboard */
+        if (key == 0x0B) {
+            if (cursor < len) {
+                shell_set_clipboard(buf + cursor, len - cursor);
+                len = cursor;
+                buf[len] = '\0';
+                REDRAW();
+            }
+            continue;
+        }
+
+        /* Ctrl+U (0x15): kill (cut) from start of line to cursor → clipboard */
+        if (key == 0x15) {
+            if (cursor > 0) {
+                shell_set_clipboard(buf, cursor);
+                memmove(buf, buf + cursor, len - cursor);
+                len -= cursor;
+                cursor = 0;
+                buf[len] = '\0';
+                REDRAW();
+            }
+            continue;
+        }
+
+        /* Ctrl+W (0x17): delete the word immediately before the cursor */
+        if (key == 0x17) {
+            int old = cursor;
+            while (cursor > 0 && buf[cursor - 1] == ' ') cursor--;
+            while (cursor > 0 && buf[cursor - 1] != ' ') cursor--;
+            if (cursor < old) {
+                shell_set_clipboard(buf + cursor, old - cursor);
+                memmove(buf + cursor, buf + old, len - old);
+                len -= (old - cursor);
+                buf[len] = '\0';
+                REDRAW();
+            }
+            continue;
+        }
+
+        /* Ctrl+V (0x16) or Ctrl+Y (0x19): paste from internal clipboard */
+        if (key == 0x16 || key == 0x19) {
+            const char* clip = shell_get_clipboard();
+            int clip_len = strlen(clip);
+            if (clip_len > 0 && len + clip_len < max_len - 1) {
+                memmove(buf + cursor + clip_len, buf + cursor, len - cursor);
+                memcpy(buf + cursor, clip, clip_len);
+                cursor += clip_len;
+                len    += clip_len;
+                buf[len] = '\0';
+                hist_idx = -1;
+                REDRAW();
+            }
             continue;
         }
 
@@ -1261,4 +1393,28 @@ static void cmd_keymap(int argc, char** argv) {
         vga_printf("  keymap: unknown layout '%s' (use 'us' or 'it')\n", argv[1]);
         vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
     }
+}
+
+static void cmd_sleep(int argc, char** argv) {
+    /*
+     * sleep <ms>
+     *
+     * Pause execution for the given number of milliseconds.
+     * Defaults to 1000 ms (1 second) if no argument is given.
+     *
+     * The timer runs at 100 Hz (1 tick = 10 ms), so the minimum
+     * resolution is 10 ms. Values below 10 ms sleep for one tick.
+     *
+     * Works in the shell AND in HeroScript:
+     *   sleep 500      # pause 500 ms
+     *   sleep 2000     # pause 2 seconds
+     */
+    uint32_t ms = 1000;
+    if (argc >= 2) ms = (uint32_t)atoi(argv[1]);
+
+    if (ms == 0) return;
+
+    /* Convert ms → 100 Hz ticks (ceiling division: 1 tick = 10 ms) */
+    uint32_t ticks = (ms + 9) / 10;
+    timer_sleep(ticks);
 }

@@ -73,4 +73,17 @@ void shell_exec_line(const char* line);
  */
 fs_node_t* shell_get_cwd(void);
 
+/*
+ * Kernel-internal clipboard — shared between the shell readline and the
+ * VIM editor.  VIM's 'yy' writes here so you can paste it in the shell
+ * with Ctrl+V, and vice-versa.
+ *
+ * NOTE: This is a kernel-internal clipboard only.  It has no connection
+ * to the host OS clipboard.  QEMU forwards raw PS/2 scan codes — there
+ * is no protocol to bridge the host clipboard to the guest without SPICE
+ * or VirtIO-clipboard infrastructure.
+ */
+void        shell_set_clipboard(const char* text, int len);
+const char* shell_get_clipboard(void);
+
 #endif /* SHELL_H */

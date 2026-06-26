@@ -343,6 +343,7 @@ static const uint8_t scancode_altgr_it[KB_SCANCODE_MAX] = {
 static bool shift_pressed = false;
 static bool caps_lock     = false;
 static bool altgr_pressed = false;  /* Right Alt / AltGr (E0+38) */
+static bool ctrl_pressed  = false;  /* Left or Right Ctrl         */
 
 /*
  * Extended key flag: set when the IRQ handler receives 0xE0.
@@ -416,12 +417,14 @@ static void keyboard_irq_handler(registers_t* regs) {
         if (scancode & 0x80) {
             /* Extended break code (key release) */
             uint8_t make = scancode & 0x7F;
-            if (make == 0x38) altgr_pressed = false;  /* Right Alt released */
+            if (make == 0x38) altgr_pressed = false;  /* Right Alt released  */
+            if (make == 0x1D) ctrl_pressed  = false;  /* Right Ctrl released */
             return;
         }
 
         /* Extended make codes */
         if (scancode == 0x38) { altgr_pressed = true; return; }  /* Right Alt / AltGr */
+        if (scancode == 0x1D) { ctrl_pressed  = true; return; }  /* Right Ctrl        */
 
         uint8_t special = 0;
         switch (scancode) {
@@ -443,12 +446,14 @@ static void keyboard_irq_handler(registers_t* regs) {
     if (scancode >= 0x80) {
         uint8_t make = scancode - 0x80;
         if (make == 0x2A || make == 0x36) shift_pressed = false;
+        if (make == 0x1D)                 ctrl_pressed  = false;  /* Left Ctrl released */
         return;
     }
 
     /* Track modifier key presses */
-    if (scancode == 0x2A || scancode == 0x36) { shift_pressed = true; return; }
-    if (scancode == 0x3A) { caps_lock = !caps_lock; return; }
+    if (scancode == 0x2A || scancode == 0x36) { shift_pressed = true;  return; }
+    if (scancode == 0x1D)                     { ctrl_pressed  = true;  return; }
+    if (scancode == 0x3A)                     { caps_lock = !caps_lock; return; }
 
     /*
      * ESC key (scan code 0x01): put 0x1B (ASCII ESC) in the buffer.
@@ -494,6 +499,39 @@ static void keyboard_irq_handler(registers_t* regs) {
         c = (uint8_t)(c - 'a' + 'A');
 
     if (c == 0) return;
+
+    /*
+     * Ctrl key held: convert letter → ASCII control character.
+     *   Ctrl+A = 0x01, Ctrl+B = 0x02, ..., Ctrl+Z = 0x1A
+     *
+     * These land in the buffer as values 0x01-0x1A (below 0x20, so
+     * they never look like printable chars to the shell or editor).
+     * The shell readline and VIM handle specific ones explicitly:
+     *   0x01 Ctrl+A  = go to start of line
+     *   0x03 Ctrl+C  = cancel / interrupt
+     *   0x04 Ctrl+D  = (reserved)
+     *   0x05 Ctrl+E  = go to end of line
+     *   0x0B Ctrl+K  = kill to end of line
+     *   0x0C Ctrl+L  = clear screen
+     *   0x0F Ctrl+O  = (reserved)
+     *   0x15 Ctrl+U  = kill to start of line
+     *   0x16 Ctrl+V  = paste from clipboard
+     *   0x17 Ctrl+W  = delete word before cursor
+     *   0x19 Ctrl+Y  = yank (paste) from clipboard
+     *
+     * Ctrl+H (0x08) = Backspace, Ctrl+I (0x09) = Tab,
+     * Ctrl+J (0x0A) = Enter — those are already produced by their
+     * dedicated keys, so we keep the same byte values here.
+     */
+    if (ctrl_pressed && c >= 'a' && c <= 'z') {
+        kb_buffer_put((uint8_t)(c - 'a' + 1));
+        return;
+    }
+    if (ctrl_pressed && c >= 'A' && c <= 'Z') {
+        kb_buffer_put((uint8_t)(c - 'A' + 1));
+        return;
+    }
+
     kb_buffer_put(c);
 }
 

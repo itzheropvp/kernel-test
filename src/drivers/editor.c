@@ -37,6 +37,7 @@
 #include "../fs/fs.h"
 #include "../libc/string.h"
 #include "../kernel/kernel.h"
+#include "../shell/shell.h"
 
 /* ---- Screen layout constants ---- */
 #define ED_CONTENT_ROWS  22   /* rows 0-21: file text              */
@@ -206,7 +207,9 @@ static void yank_line(void) {
     ed.yank_len = end - ls;
     memcpy(ed.yank, ed.buf + ls, ed.yank_len);
     ed.yank[ed.yank_len] = '\0';
-    strncpy(ed.msg, "1 line yanked", sizeof(ed.msg) - 1);
+    /* Also push to the kernel clipboard so Ctrl+V in the shell can paste it */
+    shell_set_clipboard(ed.yank, ed.yank_len);
+    strncpy(ed.msg, "1 line yanked  (Ctrl+V to paste in shell)", sizeof(ed.msg) - 1);
 }
 
 static void delete_line(void) {
