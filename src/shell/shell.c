@@ -521,9 +521,8 @@ void shell_run(void) {
     vga_print("\n");
     vga_print("  +---------------------------------------------------------+\n");
     vga_print("  |                                                         |\n");
-    vga_print("  |   KernelOS v0.1  -  A learning kernel                  |\n");
-    vga_print("  |   32-bit x86, Multiboot, VGA text mode                 |\n");
-    vga_print("  |   HeroScript (.hero) scripting enabled                 |\n");
+    vga_print("  |    KernelOS v0.1  -  A learning kernel                  |\n");
+    vga_print("  |    32-bit x86, Multiboot, VGA text mode                 |\n");
     vga_print("  |                                                         |\n");
     vga_print("  +---------------------------------------------------------+\n");
 
