@@ -49,24 +49,62 @@
 
 #include "kernel.h"
 
+/*
+ * SPECIAL KEY CODES (returned by keyboard_getkey, stored in buffer as uint8_t)
+ *
+ * PS/2 "extended" keys are prefixed with scan code 0xE0.
+ * We intercept that prefix in the IRQ handler and convert the following
+ * scan code into one of these values (all in 0x80-0x88, so no clash with
+ * ASCII printable chars 0x20-0x7E).
+ *
+ * NOTE: 0x89-0xFF is reserved for extended Latin-1 / CP437 characters
+ * typed via language-specific keyboard layouts (Italian accented vowels, etc.).
+ * Those values pass through to the shell/editor as literal bytes and are
+ * translated to CP437 for display in vga_putchar().
+ */
+#define KEY_UP    0x80
+#define KEY_DOWN  0x81
+#define KEY_LEFT  0x82
+#define KEY_RIGHT 0x83
+#define KEY_HOME  0x84
+#define KEY_END   0x85
+#define KEY_DEL   0x86
+#define KEY_PGUP  0x87
+#define KEY_PGDN  0x88
+
+/* Keyboard layout IDs passed to keyboard_set_layout() */
+#define KEYMAP_US  0   /* US QWERTY (default) */
+#define KEYMAP_IT  1   /* Italian QWERTY      */
+
 /* Initialize the keyboard driver (registers IRQ1 handler) */
 void keyboard_init(void);
 
 /*
- * keyboard_getchar - Block until a key is pressed, then return its ASCII value.
+ * keyboard_set_layout - Switch the active keyboard layout.
+ * @layout: KEYMAP_US or KEYMAP_IT
+ */
+void keyboard_set_layout(int layout);
+
+/*
+ * keyboard_getkey - Block until a key event, return it as uint8_t.
  *
- * Uses HLT to avoid spinning the CPU.
- * Returns 0 for special keys with no ASCII representation.
+ * Returns:
+ *   0x01-0x7E  — ASCII character (printable or control like \n, \b, \t)
+ *   KEY_UP/DOWN/LEFT/RIGHT/HOME/END/DEL  — special keys (>= 0x80)
+ *
+ * Use this for any new code — it handles special keys correctly.
+ */
+uint8_t keyboard_getkey(void);
+
+/*
+ * keyboard_getchar - Legacy: block and return ASCII char.
+ * Returns 0 for keys with no ASCII meaning.
  */
 char keyboard_getchar(void);
 
 /*
- * keyboard_readline - Read a full line of text into buf (up to max_len-1 chars).
- *
- * Echoes characters to the VGA display.
- * Handles backspace.
- * Stops at newline (\n) or max_len-1 characters.
- * Always null-terminates the buffer.
+ * keyboard_readline - Read a line (simple, no history/cursor movement).
+ * Used in places where we just need raw text input (e.g. format confirm prompt).
  */
 void keyboard_readline(char* buf, size_t max_len);
 

@@ -117,6 +117,58 @@ void vga_set_color(vga_color_t fg, vga_color_t bg) {
     current_color = make_color(fg, bg);
 }
 
+/*
+ * latin1_to_cp437 - Translate a Latin-1 (ISO 8859-1) byte to CP437.
+ *
+ * VGA text mode uses Code Page 437 (CP437) for character rendering, but our
+ * keyboard driver stores typed characters as Latin-1 byte values for extended
+ * chars (è, à, ì, ò, ù, ç, £, °, ...).  This function maps those Latin-1
+ * bytes to the matching CP437 glyph so they display correctly on screen.
+ *
+ * Only the characters relevant for Italian keyboard (and a few others) are
+ * listed.  Anything not in the table returns '?' as a visible placeholder.
+ */
+static uint8_t latin1_to_cp437(uint8_t c) {
+    switch (c) {
+        /* Italian keyboard characters (Latin-1 → CP437) */
+        case 0xA3: return 0x9C;  /* £ */
+        case 0xA7: return 0x15;  /* § */
+        case 0xB0: return 0xF8;  /* ° (degree) */
+        case 0xC0: return 0x41;  /* À → A (fallback) */
+        case 0xC7: return 0x80;  /* Ç */
+        case 0xC8: return 0x45;  /* È → E (fallback) */
+        case 0xC9: return 0x90;  /* É */
+        case 0xCC: return 0x49;  /* Ì → I (fallback) */
+        case 0xD2: return 0x4F;  /* Ò → O (fallback) */
+        case 0xD9: return 0x55;  /* Ù → U (fallback) */
+        case 0xE0: return 0x85;  /* à */
+        case 0xE1: return 0xA0;  /* á */
+        case 0xE2: return 0x83;  /* â */
+        case 0xE4: return 0x84;  /* ä */
+        case 0xE5: return 0x86;  /* å */
+        case 0xE6: return 0x91;  /* æ */
+        case 0xE7: return 0x87;  /* ç */
+        case 0xE8: return 0x8A;  /* è */
+        case 0xE9: return 0x82;  /* é */
+        case 0xEA: return 0x88;  /* ê */
+        case 0xEB: return 0x89;  /* ë */
+        case 0xEC: return 0x8D;  /* ì */
+        case 0xED: return 0xA1;  /* í */
+        case 0xEE: return 0x8C;  /* î */
+        case 0xEF: return 0x8B;  /* ï */
+        case 0xF1: return 0xA4;  /* ñ */
+        case 0xF2: return 0x95;  /* ò */
+        case 0xF3: return 0xA2;  /* ó */
+        case 0xF4: return 0x93;  /* ô */
+        case 0xF6: return 0x94;  /* ö */
+        case 0xF9: return 0x97;  /* ù */
+        case 0xFA: return 0xA3;  /* ú */
+        case 0xFB: return 0x96;  /* û */
+        case 0xFC: return 0x81;  /* ü */
+        default:   return '?';   /* unsupported extended char */
+    }
+}
+
 void vga_putchar(char c) {
     switch (c) {
         case '\n':
@@ -148,10 +200,17 @@ void vga_putchar(char c) {
             }
             break;
 
-        default:
-            /* Normal printable character */
+        default: {
+            /*
+             * Normal character.  Latin-1 bytes (>= 0x80) are translated to
+             * the matching CP437 glyph so accented characters (è, à, ì, ù…)
+             * display correctly in VGA text mode.
+             */
+            uint8_t glyph = (uint8_t)c;
+            if (glyph >= 0x80) glyph = latin1_to_cp437(glyph);
+
             vga_buf[cursor_row * VGA_WIDTH + cursor_col] =
-                make_entry(c, current_color);
+                (uint16_t)glyph | ((uint16_t)current_color << 8);
             cursor_col++;
 
             /* Wrap to next line if we hit the right edge */
@@ -160,6 +219,7 @@ void vga_putchar(char c) {
                 cursor_row++;
             }
             break;
+        }
     }
 
     /* Scroll if we went past the bottom */
@@ -192,3 +252,23 @@ void vga_move_cursor(uint8_t x, uint8_t y) {
 
 uint8_t vga_get_col(void) { return cursor_col; }
 uint8_t vga_get_row(void) { return cursor_row; }
+
+void vga_write_at(int row, int col, char c, vga_color_t fg, vga_color_t bg) {
+    if (row < 0 || row >= VGA_HEIGHT || col < 0 || col >= VGA_WIDTH) return;
+    uint8_t attr  = (uint8_t)fg | ((uint8_t)bg << 4);
+    uint8_t glyph = (uint8_t)c;
+    if (glyph >= 0x80) glyph = latin1_to_cp437(glyph);
+    vga_buf[row * VGA_WIDTH + col] = (uint16_t)glyph | ((uint16_t)attr << 8);
+}
+
+void vga_write_str_at(int row, int col, const char* s, vga_color_t fg, vga_color_t bg) {
+    while (*s && col < VGA_WIDTH)
+        vga_write_at(row, col++, *s++, fg, bg);
+}
+
+void vga_clear_row(int row, vga_color_t fg, vga_color_t bg) {
+    uint8_t attr = (uint8_t)fg | ((uint8_t)bg << 4);
+    uint16_t blank = ' ' | ((uint16_t)attr << 8);
+    for (int c = 0; c < VGA_WIDTH; c++)
+        vga_buf[row * VGA_WIDTH + c] = blank;
+}

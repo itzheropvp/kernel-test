@@ -88,4 +88,18 @@ void vga_move_cursor(uint8_t x, uint8_t y);
 uint8_t vga_get_col(void);
 uint8_t vga_get_row(void);
 
+/*
+ * Direct-buffer writes — do NOT move the software cursor or scroll.
+ * Used by the editor (VIM) and shell readline to write to specific
+ * screen positions without disturbing the logical cursor.
+ *
+ * WHY SEPARATE FROM vga_putchar?
+ *   vga_putchar advances cursor_col/cursor_row and triggers scrolling.
+ *   For a full-screen editor we want precise control: draw a char at
+ *   (row, col), then separately set the hardware cursor position.
+ */
+void vga_write_at(int row, int col, char c, vga_color_t fg, vga_color_t bg);
+void vga_write_str_at(int row, int col, const char* s, vga_color_t fg, vga_color_t bg);
+void vga_clear_row(int row, vga_color_t fg, vga_color_t bg);
+
 #endif /* VGA_H */

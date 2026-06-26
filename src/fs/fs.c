@@ -44,15 +44,51 @@ void fs_init(void) {
     fs_node_t* home = fs_mkdir(fs_root, "home");
     fs_mkdir(fs_root, "etc");
     fs_mkdir(fs_root, "tmp");
-    fs_mkdir(fs_root, "bin");
+    fs_node_t* bin  = fs_mkdir(fs_root, "bin");
 
     /* Create a welcome file */
     fs_node_t* motd = fs_touch(home, "welcome.txt");
     const char* msg =
         "Welcome to KernelOS!\n"
         "Type 'help' to see available commands.\n"
-        "This filesystem lives in RAM only - changes are lost on reboot.\n";
+        "Type 'run hello.hero' to run a HeroScript.\n"
+        "This filesystem lives in RAM - type 'save' to persist to disk.\n";
     fs_write(motd, msg, (uint32_t)strlen(msg));
+
+    /* Create a sample HeroScript to demonstrate the language */
+    fs_node_t* demo = fs_touch(bin, "hello.hero");
+    const char* script =
+        "# hello.hero - Sample HeroScript\n"
+        "# Run this with:  run /bin/hello.hero\n"
+        "# Or just type:   /bin/hello.hero\n"
+        "\n"
+        "set NAME KernelOS\n"
+        "set COUNT 3\n"
+        "\n"
+        "echo ----------------------------\n"
+        "echo Hello from HeroScript!\n"
+        "echo Running on $NAME\n"
+        "echo ----------------------------\n"
+        "\n"
+        "# Create a directory and file\n"
+        "mkdir /tmp/demo\n"
+        "touch /tmp/demo/notes\n"
+        "write /tmp/demo/notes This file was created by HeroScript!\n"
+        "\n"
+        "# Check it worked\n"
+        "if exists /tmp/demo/notes\n"
+        "    echo File created successfully.\n"
+        "    cat /tmp/demo/notes\n"
+        "end\n"
+        "\n"
+        "# Loop example\n"
+        "echo Counting $COUNT times:\n"
+        "repeat $COUNT\n"
+        "    beep 440 100\n"
+        "end\n"
+        "\n"
+        "echo Done!\n";
+    fs_write(demo, script, (uint32_t)strlen(script));
 }
 
 /* ============================================================

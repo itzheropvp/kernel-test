@@ -11,6 +11,8 @@
 #include "../fs/disk_fs.h"
 #include "../mm/memory.h"
 #include "../libc/string.h"
+#include "../script/script.h"
+#include "../drivers/editor.h"
 
 /* ============================================================
  * COMMAND TABLE
@@ -27,7 +29,8 @@
 /* Current working directory — starts at fs_root */
 static fs_node_t* cwd;
 
-/* Forward declarations for command handlers */
+/* Forward declarations */
+static void print_prompt(void);
 static void cmd_help(int argc, char** argv);
 static void cmd_clear(int argc, char** argv);
 static void cmd_echo(int argc, char** argv);
@@ -48,6 +51,9 @@ static void cmd_mario(int argc, char** argv);
 static void cmd_format(int argc, char** argv);
 static void cmd_save(int argc, char** argv);
 static void cmd_load(int argc, char** argv);
+static void cmd_run(int argc, char** argv);
+static void cmd_vim(int argc, char** argv);
+static void cmd_keymap(int argc, char** argv);
 
 typedef struct {
     const char* name;
@@ -75,6 +81,9 @@ static const command_t commands[] = {
     { "format", "Format data disk (WARNING: wipes disk)",cmd_format },
     { "save",   "Save filesystem to disk",               cmd_save   },
     { "load",   "Load filesystem from disk",             cmd_load   },
+    { "vim",    "Edit a file: vim <file>",                cmd_vim    },
+    { "run",    "Run a HeroScript file: run <file.hero>", cmd_run   },
+    { "keymap", "Set keyboard layout: keymap [us|it]",   cmd_keymap },
     { "halt",   "Shutdown the system",                   cmd_halt   },
     { NULL, NULL, NULL }  /* Sentinel to mark end of table */
 };
@@ -115,6 +124,281 @@ static int parse_line(char* line, char* argv[], int max_args) {
 }
 
 /* ============================================================
+ * COMMAND HISTORY
+ *
+ * Stores the last HISTORY_SIZE commands in a ring buffer.
+ * Pressing Up/Down in shell_readline navigates through them.
+ *
+ * RING BUFFER LAYOUT:
+ *   hist_head points to the NEXT slot to write.
+ *   The most recent command is at hist_head-1 (wrapping).
+ *   hist_get(0) = most recent, hist_get(1) = second most recent.
+ * ============================================================ */
+
+#define HISTORY_SIZE 16
+
+static char hist_buf[HISTORY_SIZE][SHELL_INPUT_MAX];
+static int  hist_count = 0;   /* total entries stored (capped at HISTORY_SIZE) */
+static int  hist_head  = 0;   /* ring buffer write position                    */
+
+static void hist_add(const char* line) {
+    if (!line || line[0] == '\0') return;
+    strncpy(hist_buf[hist_head], line, SHELL_INPUT_MAX - 1);
+    hist_buf[hist_head][SHELL_INPUT_MAX - 1] = '\0';
+    hist_head = (hist_head + 1) % HISTORY_SIZE;
+    if (hist_count < HISTORY_SIZE) hist_count++;
+}
+
+/* idx=0 → most recent, idx=1 → second most recent, etc. */
+static const char* hist_get(int idx) {
+    if (idx < 0 || idx >= hist_count) return NULL;
+    int pos = ((hist_head - 1 - idx) % HISTORY_SIZE + HISTORY_SIZE) % HISTORY_SIZE;
+    return hist_buf[pos];
+}
+
+/* ============================================================
+ * SHELL READLINE WITH HISTORY, TAB COMPLETE, CURSOR MOVEMENT
+ *
+ * This replaces the simple keyboard_readline() call in shell_run().
+ * Features:
+ *   ↑ / ↓         — browse command history
+ *   ← / →         — move cursor left/right (allows mid-line editing)
+ *   Home / End     — jump to start/end of input
+ *   Delete         — delete char UNDER cursor (vs Backspace = before cursor)
+ *   Tab            — autocomplete command name or filesystem path
+ *   Ctrl not supported yet (no Ctrl key tracking)
+ *
+ * HOW REDRAW WORKS:
+ *   We record prompt_col/prompt_row at the start.
+ *   On every change, we use vga_write_at() to overwrite the input area
+ *   directly in the VGA buffer (no cursor movement, no scroll).
+ *   Then vga_move_cursor() positions the blinking hardware cursor.
+ *   This avoids the scroll-while-redrawing problem.
+ * ============================================================ */
+
+static void shell_readline(char* buf, int max_len) {
+    int len         = 0;   /* chars currently in buf              */
+    int cursor      = 0;   /* cursor position within buf (0..len) */
+    int hist_idx    = -1;  /* -1 = not browsing history           */
+    int disp_len    = 0;   /* max chars we've drawn (for erase)   */
+    char saved[SHELL_INPUT_MAX];  /* input saved before history browse */
+    saved[0] = '\0';
+    buf[0]   = '\0';
+
+    /* Record where input starts: right after the "$ " prompt */
+    uint8_t prompt_col = vga_get_col();
+    uint8_t prompt_row = vga_get_row();
+
+    /* --- Inner helper: redraw the input line in-place --- */
+    #define REDRAW() do { \
+        int _end = disp_len > len ? disp_len : len; \
+        for (int _i = 0; _i < len && prompt_col + _i < VGA_WIDTH; _i++) \
+            vga_write_at(prompt_row, prompt_col + _i, buf[_i], \
+                         VGA_COLOR_WHITE, VGA_COLOR_BLACK); \
+        for (int _i = len; _i < _end && prompt_col + _i < VGA_WIDTH; _i++) \
+            vga_write_at(prompt_row, prompt_col + _i, ' ', \
+                         VGA_COLOR_WHITE, VGA_COLOR_BLACK); \
+        disp_len = len; \
+        vga_move_cursor((uint8_t)(prompt_col + cursor), prompt_row); \
+    } while(0)
+
+    while (1) {
+        uint8_t key = keyboard_getkey();
+
+        /* --- ENTER --- */
+        if (key == '\n' || key == '\r') {
+            vga_move_cursor(0, prompt_row);
+            vga_putchar('\n');
+            if (len > 0) hist_add(buf);
+            break;
+        }
+
+        /* --- BACKSPACE --- */
+        if (key == '\b') {
+            if (cursor > 0) {
+                memmove(buf + cursor - 1, buf + cursor, len - cursor);
+                cursor--;
+                len--;
+                buf[len] = '\0';
+                REDRAW();
+            }
+            continue;
+        }
+
+        /* --- TAB: autocomplete --- */
+        if (key == '\t') {
+            /* Find start of the word being typed */
+            int word_start = cursor;
+            while (word_start > 0 && buf[word_start - 1] != ' ') word_start--;
+
+            char prefix[SHELL_INPUT_MAX];
+            int prefix_len = cursor - word_start;
+            strncpy(prefix, buf + word_start, prefix_len);
+            prefix[prefix_len] = '\0';
+
+            bool first_word = (word_start == 0);
+
+            /* Collect matches */
+            const char* matches[32];
+            int n = 0;
+
+            if (first_word) {
+                /* Match command names */
+                for (int i = 0; commands[i].name && n < 32; i++) {
+                    if (strncmp(commands[i].name, prefix, prefix_len) == 0)
+                        matches[n++] = commands[i].name;
+                }
+            } else {
+                /* Match filesystem entries */
+                const char* slash = strrchr(prefix, '/');
+                fs_node_t*  dir;
+                const char* name_part;
+                char dir_path[FS_MAX_NAME * 2];
+
+                if (slash) {
+                    int dlen = (int)(slash - prefix);
+                    if (dlen == 0) { dir_path[0] = '/'; dir_path[1] = '\0'; }
+                    else { strncpy(dir_path, prefix, dlen); dir_path[dlen] = '\0'; }
+                    dir       = fs_resolve(dir_path, cwd);
+                    name_part = slash + 1;
+                } else {
+                    dir       = cwd;
+                    name_part = prefix;
+                }
+
+                int nlen = strlen(name_part);
+                if (dir && dir->type == FS_TYPE_DIR) {
+                    for (int i = 0; i < FS_MAX_CHILDREN && n < 32; i++) {
+                        fs_node_t* ch = dir->children[i];
+                        if (ch && ch->in_use &&
+                            strncmp(ch->name, name_part, nlen) == 0)
+                            matches[n++] = ch->name;
+                    }
+                }
+            }
+
+            if (n == 1) {
+                /* Single match: insert the rest of the word */
+                const char* m    = matches[0];
+                /* How many chars of this match already typed? */
+                const char* base = strrchr(prefix, '/');
+                base = base ? base + 1 : prefix;
+                int typed = strlen(base);
+                const char* tail = m + typed;
+                int tlen = strlen(tail);
+
+                if (len + tlen < max_len - 1) {
+                    memmove(buf + cursor + tlen, buf + cursor, len - cursor);
+                    memcpy(buf + cursor, tail, tlen);
+                    cursor += tlen;
+                    len    += tlen;
+                    buf[len] = '\0';
+
+                    /* Add trailing space for commands */
+                    if (first_word && len < max_len - 1) {
+                        memmove(buf + cursor + 1, buf + cursor, len - cursor);
+                        buf[cursor++] = ' ';
+                        len++;
+                        buf[len] = '\0';
+                    }
+                    REDRAW();
+                }
+            } else if (n > 1) {
+                /* Multiple matches: show them below and reprint prompt */
+                vga_move_cursor(0, prompt_row);
+                vga_putchar('\n');
+                vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+                for (int i = 0; i < n; i++) {
+                    vga_print(matches[i]);
+                    vga_print("  ");
+                }
+                vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+                vga_putchar('\n');
+                /* Reprint the prompt so user can continue typing */
+                print_prompt();
+                prompt_col = vga_get_col();
+                prompt_row = vga_get_row();
+                disp_len   = 0;
+                REDRAW();
+            }
+            /* n == 0: no match — do nothing */
+            continue;
+        }
+
+        /* --- ESCAPE: clear line --- */
+        if (key == 0x1B) {
+            cursor = 0; len = 0; buf[0] = '\0';
+            hist_idx = -1;
+            REDRAW();
+            continue;
+        }
+
+        /* --- ARROW KEYS AND NAVIGATION --- */
+        if (key == KEY_UP) {
+            if (hist_idx == -1) {
+                strncpy(saved, buf, SHELL_INPUT_MAX - 1);
+                saved[SHELL_INPUT_MAX - 1] = '\0';
+            }
+            const char* entry = hist_get(hist_idx + 1);
+            if (entry) {
+                hist_idx++;
+                strncpy(buf, entry, max_len - 1);
+                buf[max_len - 1] = '\0';
+                len = cursor = strlen(buf);
+                REDRAW();
+            }
+            continue;
+        }
+        if (key == KEY_DOWN) {
+            if (hist_idx > 0) {
+                hist_idx--;
+                const char* entry = hist_get(hist_idx);
+                strncpy(buf, entry, max_len - 1);
+                buf[max_len - 1] = '\0';
+            } else {
+                hist_idx = -1;
+                strncpy(buf, saved, max_len - 1);
+                buf[max_len - 1] = '\0';
+            }
+            len = cursor = strlen(buf);
+            REDRAW();
+            continue;
+        }
+        if (key == KEY_LEFT)  { if (cursor > 0)   { cursor--; vga_move_cursor((uint8_t)(prompt_col + cursor), prompt_row); } continue; }
+        if (key == KEY_RIGHT) { if (cursor < len)  { cursor++; vga_move_cursor((uint8_t)(prompt_col + cursor), prompt_row); } continue; }
+        if (key == KEY_HOME)  { cursor = 0;   vga_move_cursor(prompt_col, prompt_row); continue; }
+        if (key == KEY_END)   { cursor = len; vga_move_cursor((uint8_t)(prompt_col + cursor), prompt_row); continue; }
+        if (key == KEY_DEL)   {
+            if (cursor < len) {
+                memmove(buf + cursor, buf + cursor + 1, len - cursor - 1);
+                len--;
+                buf[len] = '\0';
+                REDRAW();
+            }
+            continue;
+        }
+
+        /* --- PRINTABLE CHARACTER: insert at cursor ---
+         * Accept standard ASCII (0x20-0x7E) and extended Latin-1 (0x89+).
+         * The gap 0x80-0x88 is reserved for KEY_UP/DOWN/LEFT/RIGHT/etc.
+         */
+        if ((key >= 0x20 && key < 0x80) || key >= 0x89) {
+            if (len < max_len - 1) {
+                memmove(buf + cursor + 1, buf + cursor, len - cursor);
+                buf[cursor] = (char)key;
+                cursor++;
+                len++;
+                buf[len] = '\0';
+                hist_idx = -1;
+                REDRAW();
+            }
+        }
+    }
+
+    #undef REDRAW
+}
+
+/* ============================================================
  * PROMPT
  * ============================================================ */
 
@@ -142,12 +426,81 @@ static void print_prompt(void) {
 }
 
 /* ============================================================
+ * PUBLIC SHELL API
+ * ============================================================ */
+
+struct fs_node* shell_get_cwd(void) {
+    return cwd;
+}
+
+/*
+ * shell_exec_line - Parse and execute one command string.
+ *
+ * This is the heart of the shell — it's called both by the interactive
+ * loop (when the user presses Enter) and by the HeroScript interpreter
+ * (when a script line is not a scripting keyword).
+ *
+ * This separation is the key design pattern:
+ *   interactive prompt  →  shell_exec_line()
+ *   HeroScript line     →  shell_exec_line()   (same code path!)
+ *
+ * SPECIAL BEHAVIOR:
+ *   - Lines starting with '#' are treated as comments (ignored).
+ *   - A filename ending in ".hero" is treated as "run <filename>".
+ *     This lets you type  hello.hero  directly, like typing  ./hello.sh
+ *     in bash.
+ */
+void shell_exec_line(const char* input) {
+    char   line[SHELL_INPUT_MAX];
+    char*  argv[SHELL_ARGS_MAX];
+
+    /* Work on a copy — parse_line modifies the string in place */
+    strncpy(line, input, SHELL_INPUT_MAX - 1);
+    line[SHELL_INPUT_MAX - 1] = '\0';
+
+    /* Strip leading whitespace */
+    char* p = line;
+    while (*p == ' ' || *p == '\t') p++;
+
+    /* Ignore empty lines and comment lines */
+    if (*p == '\0' || *p == '#') return;
+
+    int argc = parse_line(p, argv, SHELL_ARGS_MAX);
+    if (argc == 0) return;
+
+    /*
+     * AUTO-RUN .hero FILES
+     *
+     * If the first token ends with ".hero", treat it as "run <filename>".
+     * Lets you type  hello.hero  directly instead of  run hello.hero,
+     * similar to how bash lets you run  ./script.sh  without typing 'bash'.
+     */
+    int name_len = strlen(argv[0]);
+    if (name_len > 5 && strcmp(argv[0] + name_len - 5, ".hero") == 0) {
+        char* run_argv[2] = { (char*)"run", argv[0] };
+        cmd_run(2, run_argv);
+        return;
+    }
+
+    /* Normal command table dispatch */
+    for (int i = 0; commands[i].name != NULL; i++) {
+        if (strcmp(argv[0], commands[i].name) == 0) {
+            commands[i].func(argc, argv);
+            return;
+        }
+    }
+
+    vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+    vga_printf("  Error: unknown command '%s'. Type 'help'.\n", argv[0]);
+    vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+}
+
+/* ============================================================
  * MAIN SHELL LOOP
  * ============================================================ */
 
 void shell_run(void) {
     char input[SHELL_INPUT_MAX];
-    char* argv[SHELL_ARGS_MAX];
 
     cwd = fs_root;
 
@@ -170,43 +523,18 @@ void shell_run(void) {
     vga_print("  |                                                         |\n");
     vga_print("  |   KernelOS v0.1  -  A learning kernel                  |\n");
     vga_print("  |   32-bit x86, Multiboot, VGA text mode                 |\n");
+    vga_print("  |   HeroScript (.hero) scripting enabled                 |\n");
     vga_print("  |                                                         |\n");
     vga_print("  +---------------------------------------------------------+\n");
 
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
     vga_print("\n  Type 'help' for available commands.\n\n");
-
     vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
 
     while (1) {
-        /* Show the prompt */
         print_prompt();
-
-        /* Read a line of input */
-        keyboard_readline(input, SHELL_INPUT_MAX);
-
-        /* Skip empty lines */
-        if (input[0] == '\0') continue;
-
-        /* Parse the command line into argc/argv */
-        int argc = parse_line(input, argv, SHELL_ARGS_MAX);
-        if (argc == 0) continue;
-
-        /* Look up the command in our table */
-        bool found = false;
-        for (int i = 0; commands[i].name != NULL; i++) {
-            if (strcmp(argv[0], commands[i].name) == 0) {
-                commands[i].func(argc, argv);
-                found = true;
-                break;
-            }
-        }
-
-        if (!found) {
-            vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
-            vga_printf("  Error: unknown command '%s'. Type 'help' for help.\n", argv[0]);
-            vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
-        }
+        shell_readline(input, SHELL_INPUT_MAX);
+        shell_exec_line(input);
     }
 }
 
@@ -755,6 +1083,97 @@ static void cmd_load(int argc, char** argv) {
     vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
 }
 
+static void cmd_vim(int argc, char** argv) {
+    /*
+     * vim <filename>
+     *
+     * Opens the file in the built-in VIM-like editor.
+     * If the file doesn't exist, creates it first with touch.
+     * On :wq or :w the content is saved back to the filesystem node.
+     */
+    if (argc < 2) {
+        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+        vga_print("  Usage: vim <filename>\n");
+        vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+        return;
+    }
+
+    fs_node_t* node = fs_resolve(argv[1], cwd);
+
+    /* Create the file if it doesn't exist */
+    if (!node) {
+        node = fs_touch(cwd, argv[1]);
+        if (!node) {
+            vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+            vga_printf("  vim: cannot create '%s'\n", argv[1]);
+            vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+            return;
+        }
+    }
+
+    if (node->type != FS_TYPE_FILE) {
+        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+        vga_printf("  vim: '%s' is a directory\n", argv[1]);
+        vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+        return;
+    }
+
+    editor_open(node, argv[1]);
+
+    /* After the editor exits, vga_clear() was called — reprint the shell state */
+    vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+}
+
+static void cmd_run(int argc, char** argv) {
+    /*
+     * run <file.hero>
+     *
+     * Finds the named file in the filesystem, reads its content,
+     * and passes it to the HeroScript interpreter (script_run).
+     *
+     * If you omit the .hero extension, we try to add it automatically.
+     * So both of these work:
+     *   run hello
+     *   run hello.hero
+     */
+    if (argc < 2) {
+        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+        vga_print("  Usage: run <file.hero>\n");
+        vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+        return;
+    }
+
+    /* Try to find the file as given */
+    fs_node_t* node = fs_resolve(argv[1], cwd);
+
+    /* If not found and doesn't already end in .hero, try adding the extension */
+    if (!node) {
+        int n = strlen(argv[1]);
+        if (n < 5 || strcmp(argv[1] + n - 5, ".hero") != 0) {
+            char with_ext[FS_MAX_NAME];
+            ksprintf(with_ext, "%s.hero", argv[1]);
+            node = fs_resolve(with_ext, cwd);
+        }
+    }
+
+    if (!node) {
+        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+        vga_printf("  run: file not found: %s\n", argv[1]);
+        vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+        return;
+    }
+
+    if (node->type != FS_TYPE_FILE) {
+        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+        vga_printf("  run: '%s' is not a file\n", argv[1]);
+        vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+        return;
+    }
+
+    /* Hand off to the HeroScript interpreter */
+    script_run(node->data, node->size);
+}
+
 static void cmd_halt(int argc, char** argv) {
     (void)argc; (void)argv;
     vga_set_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK);
@@ -786,4 +1205,61 @@ static void cmd_halt(int argc, char** argv) {
     vga_print("  (Could not ACPI shutdown - halting CPU)\n");
     __asm__ volatile ("cli; hlt");
     while (1) {}
+}
+
+static void cmd_keymap(int argc, char** argv) {
+    /*
+     * keymap         — show current layout
+     * keymap us      — switch to US QWERTY
+     * keymap it      — switch to Italian QWERTY
+     *
+     * Italian keyboard differences from US:
+     *   - Accented vowels on dedicated keys: è à ì ò ù
+     *   - Apostrophe key where US has '-'
+     *   - Slash moved: the '-' key is where US '/' is
+     *   - Shift layer differs: Shift+2=" Shift+7=/ Shift+8=( etc.
+     *   - AltGr gives access to: @ # { [ ] }
+     *     AltGr+2=@  AltGr+3=#  AltGr+7={  AltGr+8=[  AltGr+9=]  AltGr+0=}
+     *     AltGr+ì=`  (backtick, not otherwise reachable on Italian layout)
+     */
+    if (argc < 2) {
+        /* Show current layout */
+        vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+        /* We can't easily query current_keymap from here — just show the hint */
+        vga_print("\n  Usage: keymap <us|it>\n");
+        vga_print("  Layouts available:\n");
+        vga_print("    us   US QWERTY (default)\n");
+        vga_print("    it   Italian QWERTY (with AltGr for @ # { [ ] })\n\n");
+        vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+        return;
+    }
+
+    if (strcmp(argv[1], "it") == 0) {
+        keyboard_set_layout(KEYMAP_IT);
+        vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+        vga_print("  Keyboard layout: Italian (it)\n");
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+        vga_print("  AltGr+2=@  AltGr+3=#  AltGr+7={  AltGr+8=[  AltGr+9=]  AltGr+0=}\n");
+        vga_print("  AltGr+ì=`   ISO key (</>)  accented vowels: e'=");
+        vga_putchar((char)0xE8); /* è */
+        vga_print(" a'=");
+        vga_putchar((char)0xE0); /* à */
+        vga_print(" i'=");
+        vga_putchar((char)0xEC); /* ì */
+        vga_print(" o'=");
+        vga_putchar((char)0xF2); /* ò */
+        vga_print(" u'=");
+        vga_putchar((char)0xF9); /* ù */
+        vga_print("\n");
+        vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+    } else if (strcmp(argv[1], "us") == 0) {
+        keyboard_set_layout(KEYMAP_US);
+        vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+        vga_print("  Keyboard layout: US QWERTY (us)\n");
+        vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+    } else {
+        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+        vga_printf("  keymap: unknown layout '%s' (use 'us' or 'it')\n", argv[1]);
+        vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+    }
 }
